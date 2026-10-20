@@ -47,7 +47,34 @@ $ErrorActionPreference = "Stop"
 $Root       = $PSScriptRoot
 $Warships   = Split-Path $Root -Parent
 $ToolsDir   = Join-Path $Warships "_tools"
-$Blender    = Join-Path $ToolsDir "blender-4.5.10-windows-x64\blender.exe"
+
+# Blender 的 Windows 压缩包解压后目录名带版本号（如 blender-4.5.10-windows-x64），
+# 每次升级都会变，所以这里自动查找，取版本号最大的那个。
+# 优先级：WOWS_BLENDER 环境变量 > _tools/blender-*/blender.exe > 历史默认路径
+function Find-Blender([string]$ToolsDir) {
+    if ($env:WOWS_BLENDER) { return $env:WOWS_BLENDER }
+
+    $candidates = Get-ChildItem -Path $ToolsDir -Directory -Filter "blender-*" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $exe = Join-Path $_.FullName "blender.exe"
+            if (Test-Path $exe) {
+                # 从目录名解析 x.y.z 用于排序；解析不出来就当 0.0.0
+                $m = [regex]::Match($_.Name, 'blender-(\d+)\.(\d+)\.?(\d+)?')
+                $ver = if ($m.Success) {
+                    [version]("{0}.{1}.{2}" -f [int]$m.Groups[1].Value,
+                                              [int]$m.Groups[2].Value,
+                                              $(if ($m.Groups[3].Value) { [int]$m.Groups[3].Value } else { 0 }))
+                } else { [version]"0.0.0" }
+                [pscustomobject]@{ Path = $exe; Version = $ver }
+            }
+        }
+    if ($candidates) {
+        return ($candidates | Sort-Object Version -Descending | Select-Object -First 1).Path
+    }
+    return Join-Path $ToolsDir "blender-4.5.10-windows-x64\blender.exe"
+}
+
+$Blender    = Find-Blender $ToolsDir
 $Exporter   = Join-Path $ToolsDir "model-exporter\wows-gltf-exporter.exe"
 $ListShips  = Join-Path $ToolsDir "model-exporter\wows-list-ships.exe"
 $RenderPy   = Join-Path $Root "render_ship.py"

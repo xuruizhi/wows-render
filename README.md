@@ -8,8 +8,21 @@
 - 两种入口：**本地网页 UI**（选船、排队、看进度、内联预览）+ **命令行批量**
 - 中文舰名直接从游戏自带 `global.mo` 提取，795 艘零漏配
 
-> **本仓库不含任何游戏素材。** 没有图片、没有模型、没有游戏文件、没有第三方工具二进制。
-> 仓库里只有脚本和两张已生成的舰船目录 JSON，其余都要在你本机自己跑出来或自己下载。
+## 效果预览
+
+| 金刚〈R系 战列舰 V 级〉 | 俾斯麦〈D系 战列舰 VIII 级〉 |
+|---|---|
+| ![金刚](docs/screenshots/01-kongo-hero.jpg) | ![俾斯麦](docs/screenshots/02-bismarck-hero.jpg) |
+
+| 俾斯麦 · 正侧舷视角 | 祖国〈F系 战列舰 ★ 级〉 |
+|---|---|
+| ![俾斯麦侧舷](docs/screenshots/03-bismarck-side.jpg) | ![祖国](docs/screenshots/04-patrie-hero.jpg) |
+
+<sub>以上为 **1280–1920 宽** 的压缩预览。实际输出支持到 **15360×8640（16K）**，源图是 PNG 无损。</sub>
+
+> **本仓库不含原始游戏素材。** 没有游戏文件、模型、贴图，也没有第三方工具二进制。
+> 仓库里只有脚本、两张已生成的舰船目录 JSON，以及上面几张用于展示效果的压缩样图。
+> 渲染结果是从游戏模型派生的，版权说明见 [版权与许可](#版权与许可)。
 
 ---
 
@@ -67,13 +80,18 @@ GameParams + .geometry  ──▶  wows-gltf-exporter  ──▶  Bismarck.raw.g
 |---|---|---|
 | Windows | 10 / 11 | 渲染链目前只在 Windows 验证过 |
 | Python | 3.11+ | [python.org](https://www.python.org/downloads/) |
-| Blender | 4.5.x | [blender.org](https://www.blender.org/download/)，解压到 `_tools/blender-4.5.10-windows-x64/` |
+| Blender | 4.5.x（验证于 4.5.10） | [blender.org](https://www.blender.org/download/)，解压到 `_tools/` 下 |
 | [wows-model-exporter](https://github.com/wows-tools/wows-model-exporter) | latest release | 解压到 `_tools/model-exporter/` |
 | [wows-depack](https://github.com/wows-tools/wows-depack) | latest release | 解压到 `_tools/wows-depack/` |
 | World of Warships | 客户端 | 提供模型与 `global.mo` |
 | NVIDIA GPU | 建议 | Cycles GPU 渲染；纯 CPU 也能跑，但慢一个数量级 |
 
-目录名必须和上面一致，否则脚本会报 `missing dependency: ...`。
+**关于 Blender 的目录名**：Windows 压缩包解压后是带版本号的目录，例如 `blender-4.5.10-windows-x64/`。
+脚本会**自动扫描** `_tools/blender-*/blender.exe` 并选版本号最高的一个，所以：
+
+- 升级到 `blender-4.5.11-windows-x64` 之类的名字**不需要改代码**
+- 想固定用某一个，设 `WOWS_BLENDER` 环境变量指向具体的 `blender.exe` 即可
+- `model-exporter/` 和 `wows-depack/` 的目录名则**必须保持一致**，否则报 `missing dependency: ...`
 
 ### 2. 配置游戏路径
 
@@ -318,7 +336,18 @@ game dir not found: Z:\nope
 ## 常见问题
 
 **Q：报 `missing dependency: ...`？**
-`_tools/` 下三样东西缺了或者目录名不对。核对 `blender-4.5.10-windows-x64/blender.exe`、`model-exporter/wows-gltf-exporter.exe`、`model-exporter/wows-list-ships.exe`。
+`_tools/` 下的东西缺了或目录名不对。核对这三处：
+
+- `_tools/blender-*/blender.exe`（版本号随意，会自动找；也可以用 `WOWS_BLENDER` 指定）
+- `_tools/model-exporter/wows-gltf-exporter.exe`
+- `_tools/model-exporter/wows-list-ships.exe`
+
+**Q：Blender 升级后脚本找不到它？**
+正常情况下自动扫描 `_tools/blender-*` 会选中版本号最高的那个。如果目录名不符合 `blender-<版本>-*` 的格式，设环境变量显式指定：
+
+```powershell
+$env:WOWS_BLENDER = "D:\path\to\blender.exe"
+```
 
 **Q：导出器说找不到船 / 游戏版本不支持？**
 客户端更新后模型格式可能变化，升级 `wows-model-exporter` 到最新 release。
@@ -347,9 +376,12 @@ game dir not found: Z:\nope
 
 **本仓库的版权边界**
 
-- 本仓库**不包含**任何 Wargaming 素材：没有游戏文件、没有模型、没有图片
-- 本仓库**不包含**从 Wiki 或游戏提取的图库数据
-- 只有脚本 + 从游戏文本资源派生的**舰名映射**（`shipnames_zh.json`）与舰船属性目录（`ships.json`）
+- 本仓库**不包含**游戏文件、模型、贴图等原始素材
+- 本仓库**不包含**从 Wiki 提取的图库数据
+- 代码 + 从游戏文本资源派生的**舰名映射**（`shipnames_zh.json`）与舰船属性目录（`ships.json`）
+- `docs/screenshots/` 下的 4 张**压缩预览图**是唯一的渲染成品素材，仅用于展示本项目效果
+
+**关于渲染结果**
 
 用这些脚本渲染出的图片是游戏模型的**衍生作品**，模型版权归 Wargaming.net 所有。
 本仓库不为此类渲染结果授予任何再分发权利——是否公开、如何使用，请自行评估并遵守当地法律与 Wargaming 的最终用户协议。

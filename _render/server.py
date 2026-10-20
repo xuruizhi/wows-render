@@ -26,7 +26,38 @@ from urllib.parse import urlparse, unquote
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WARSHIPS = os.path.dirname(ROOT)
 TOOLS = os.path.join(WARSHIPS, "_tools")
-BLENDER = os.path.join(TOOLS, "blender-4.5.10-windows-x64", "blender.exe")
+
+
+def find_blender(tools_dir):
+    """Locate blender.exe under _tools/.
+
+    Blender's Windows zip unpacks into a versioned folder such as
+    blender-4.5.10-windows-x64, so the exact name changes with every release.
+    Priority:
+      1. WOWS_BLENDER env var (explicit override)
+      2. any _tools/blender-*/blender.exe, preferring the highest version
+      3. the historically documented path, so error messages stay familiar
+    """
+    override = os.environ.get("WOWS_BLENDER")
+    if override:
+        return override
+
+    import glob
+    import re
+
+    def version_key(path):
+        # path 形如 .../_tools/blender-4.5.11-windows-x64/blender.exe，
+        # 版本号在父目录名里，不能只看 basename。
+        m = re.search(r"blender-(\d+)\.(\d+)\.?(\d+)?", os.path.basename(os.path.dirname(path)))
+        return tuple(int(g) if g else 0 for g in m.groups()) if m else (0, 0, 0)
+
+    found = glob.glob(os.path.join(tools_dir, "blender-*", "blender.exe"))
+    if found:
+        return max(found, key=version_key)
+    return os.path.join(tools_dir, "blender-4.5.10-windows-x64", "blender.exe")
+
+
+BLENDER = find_blender(TOOLS)
 EXPORTER = os.path.join(TOOLS, "model-exporter", "wows-gltf-exporter.exe")
 LIST_SHIPS = os.path.join(TOOLS, "model-exporter", "wows-list-ships.exe")
 RENDER_PY = os.path.join(ROOT, "render_ship.py")

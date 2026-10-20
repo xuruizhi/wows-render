@@ -35,8 +35,11 @@ if defined WOWS_GAME_DIR (
 )
 
 rem ---- sanity check dependencies ----
-if not exist "..\_tools\blender-4.5.10-windows-x64\blender.exe" (
-    echo [警告] 未找到 Blender: ..\_tools\blender-4.5.10-windows-x64\blender.exe
+rem Blender 目录名带版本号，这里用通配符匹配
+set "BLENDER_FOUND="
+for /d %%d in ("..\_tools\blender-*") do if exist "%%d\blender.exe" set "BLENDER_FOUND=%%d\blender.exe"
+if not defined BLENDER_FOUND (
+    echo [警告] 未找到 Blender: ..\_tools\blender-*\blender.exe
 )
 if not exist "..\_tools\model-exporter\wows-gltf-exporter.exe" (
     echo [警告] 未找到模型导出器: ..\_tools\model-exporter\wows-gltf-exporter.exe
