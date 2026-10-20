@@ -1,0 +1,23 @@
+# ============================================================
+#  行尾与编码约定
+# ============================================================
+
+# 默认：文本按 LF 入库，Windows 检出为 CRLF
+* text=auto
+
+# PowerShell 脚本统一 LF
+*.ps1 text eol=lf
+*.py  text eol=lf
+*.md  text eol=lf
+*.json text eol=lf
+
+# Wiki 快照：原样存取，不做任何换行/编码改写
+*.wiki -text
+
+# 批处理必须是 CRLF + GBK，禁止 Git 改动它的换行符
+*.bat -text
+*.cmd -text
+
+# 数据表原样存取（含 UTF-8 BOM 与制表符）
+*.tsv -text
+*.csv -text

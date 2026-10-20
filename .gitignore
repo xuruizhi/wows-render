@@ -1,0 +1,61 @@
+# ============================================================
+#  WoWs Archive — 哪些东西不进仓库
+#  仓库只放：渲染管线脚本 + 已生成的中文舰名/船只目录
+#  不放：Wiki 图库及其全部衍生数据、渲染输出、第三方二进制
+# ============================================================
+
+# ---------- Wiki 图库：整条产线（版权风险）----------
+# 抓取脚本、中间数据、wikitext 快照、README 全部排除。
+# 只在本地保留，不随仓库分发。
+/WoWs_Gallery/
+/_wikitext/
+/_parse.ps1
+/_build_manifest.ps1
+/_categories.ps1
+/_resolve_urls.ps1
+/_make_plan.ps1
+/_download.ps1
+/_index.ps1
+/_ships.txt
+/_catmap.txt
+/_shipcats.tsv
+/_manifest.tsv
+/_images.tsv
+/_download_plan.tsv
+/_download_log.tsv
+/_dl_tmp/
+*.part
+
+# ---------- 渲染输出（游戏模型衍生作品，单张可达 11 MB）----------
+/WoWs_Renders/
+/_render/glb/
+*.glb
+*.raw.glb
+
+# ---------- 第三方二进制（≈1.1 GB，自行下载）----------
+/_tools/
+
+# ---------- 运行期日志 ----------
+/_render/render_log.tsv
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+*.swp
+
+# ---------- 其他临时文件 ----------
+*.tmp
+*.bak
+*.orig
