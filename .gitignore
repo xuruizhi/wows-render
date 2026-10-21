@@ -59,3 +59,9 @@ desktop.ini
 *.tmp
 *.bak
 *.orig
+
+# ---------- render A/B scratch ----------
+/_render/_probe_out/
+
+# ---------- extracted PBS textures (large, regenerate with extract_ship_textures.py) ----------
+/_render/textures/

@@ -7,7 +7,7 @@ For each ship:
   3. Blender + Cycles    -> 4K PNG renders
 
 Output layout mirrors the existing wiki gallery:
-  WoWs_Renders/<Nation>/<Type>/Tier <Tier>/<ShipKey>/<view>.png
+  WoWs_Renders/<Nation>/<Type>/Tier <Tier>/<ShipKey>/<view>_<W>x<H>.png
 
 Usage
 -----
@@ -36,6 +36,8 @@ param(
     [string] $TexSize   = "4096",
     [switch] $SkipExisting,
     [switch] $KeepGlb,
+    # 游戏 PBS 贴图（_a/_mg/_n/_ao）。默认开启，--NoPbsMaps 可退回旧的光照猜测模式
+    [switch] $NoPbsMaps,
     # 以下两项可覆盖环境变量和内置默认值
     [string] $GameDir   = "",
     [string] $Python    = ""
@@ -79,6 +81,8 @@ $Exporter   = Join-Path $ToolsDir "model-exporter\wows-gltf-exporter.exe"
 $ListShips  = Join-Path $ToolsDir "model-exporter\wows-list-ships.exe"
 $RenderPy   = Join-Path $Root "render_ship.py"
 $SanitizePy = Join-Path $Root "sanitize_glb.py"
+$ExtractTexPy = Join-Path $Root "extract_ship_textures.py"
+$TexDir     = Join-Path $Root "textures"
 
 # ------------------------------------------------------------------ overridable paths
 # 这两项可以用环境变量覆盖，也可以在命令行显式传参：
@@ -225,7 +229,9 @@ foreach ($ship in $targets) {
     $mask = "RENDER $idx/$($targets.Count) $($ship.Key) [$($ship.Nation)/$($ship.Type)/T$($ship.Tier)]"
 
     $heroName = ($Views -split ",")[0].Trim()
-    $heroPath = Join-Path $outDir "$heroName.png"
+    # render_ship.py writes <view>_<W>x<H>.png, so the existence probe must use
+    # the same resolution suffix, otherwise -SkipExisting never matches
+    $heroPath = Join-Path $outDir "$($heroName)_$Res.png"
     if ($SkipExisting -and (Test-Path $heroPath)) {
         Write-Host "$mask -> skip (exists)" -ForegroundColor DarkGray
         $skipCount++
@@ -255,6 +261,21 @@ foreach ($ship in $targets) {
             throw "sanitize failed: $sanOut"
         }
 
+        # ---- 2b. game PBS maps (_a/_mg/_n/_ao) so shading matches the game
+        # textures are flat in $TexDir and keyed by resource dir name, which
+        # shared parts let several ships reuse
+        $texArgs = @()
+        if (-not $NoPbsMaps) {
+            Write-Host "`r$mask | extracting PBS maps..." -ForegroundColor Cyan -NoNewline
+            $texOut = & $Python $ExtractTexPy --ship $ship.Key --nation $ship.Nation --type $ship.Type --out $TexDir 2>&1 | Out-String
+            if ($texOut -match "EXTRACT_OK") {
+                $texArgs = @("--textures", $TexDir)
+            } else {
+                Write-Warning "$($ship.Key): PBS maps unavailable, falling back to flat shading"
+                Write-Host $texOut
+            }
+        }
+
         # ---- 3. render
         Write-Host "`r$mask | rendering $Views ..." -ForegroundColor Yellow -NoNewline
         $blenderArgs = @(
@@ -265,7 +286,7 @@ foreach ($ship in $targets) {
             "--samples", "$Samples",
             "--views", $Views,
             "--preset", $Preset
-        )
+        ) + $texArgs
         $rOut = & $Blender @blenderArgs 2>&1 | Out-String
         if ($rOut -notmatch "RENDER_OK") {
             throw "blender failed: $(($rOut -split "`n" | Where-Object { $_ -match 'Error|Traceback|RENDER_ERROR' } | Select-Object -Last 3) -join ' ')"

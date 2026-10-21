@@ -80,10 +80,7 @@ RESOLUTIONS = [
 ]
 
 PRESETS = [
-    {"value": "day",    "zh": "白昼"},
-    {"value": "sunset", "zh": "日落"},
-    {"value": "blue",   "zh": "蓝调"},
-    {"value": "storm",  "zh": "阴天"},
+    {"value": "day", "zh": "白昼"},
 ]
 
 

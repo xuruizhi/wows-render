@@ -101,15 +101,72 @@ cd D:\xupeiyu\obsidian-xupeiyu\1.tools\warships\_render
 | `build_catalog.py` | 生成 `ships.json`（合并船表 + 中文名 + 标签） |
 | `extract_names.py` | 从 `global.mo` 提取中文舰名 |
 | `ships.json` | 795 艘船的中文目录（已生成） |
-| `render_ship.py` | Blender 渲染脚本（自动取景/光照/海面/雾） |
+| `render_ship.py` | Blender 渲染脚本（游戏 PBS 材质/光照/海面/雾） |
+| `extract_ship_textures.py` | 从游戏包导出 a/mg/n/ao 贴图为 PNG |
 | `sanitize_glb.py` | 修复导出器的空 mesh 问题 |
 | `render_all.ps1` | 命令行批量渲染 |
 
-游戏内新增/改名的船，重跑一次 `python build_catalog.py` 即可更新清单。
+## 游戏 PBS 贴图（重要）
+
+导出器只写颜色贴图，因此默认渲染是"平面灰"的。本流程会额外从游戏包里取出
+游戏着色器所用的四张贴图，按游戏的通道语义接进材质：
+
+| 贴图 | 内容 |
+|---|---|
+| `_a` | 漫反射（颜色） |
+| `_mg` | **R = 金属度，B = 光泽度**（实际测出的打包方式） |
+| `_n` | 法线，**只用 R/G**，z 由 `sqrt(1-x²-y²)` 重建 |
+| `_ao` | 环境光遮蔽 |
+
+贴图默认自动提取到 `textures/`（`render_all.ps1` 与网页服务都会做）。
+想退回旧的平面着色：批量脚本加 `-NoPbsMaps`，单次渲染不加 `--textures`。
+
+## 光照与色调映射
+
+游戏用**单方向光 + PMREM 环境光**，没有补光灯，色调映射是一条 GT 曲线。
+渲染脚本默认按这个方向走：
+
+| 参数 | 作用 |
+|---|---|
+| （默认） | 不加补光灯，靠环境光（`--env-boost`，默认 1.45）撑暗部 |
+| `--fill-light` | 恢复旧的补光灯（更亮，但不符合游戏） |
+| `--gt-tonemap` | GT 曲线近似，**默认开启**；`--no-gt-tonemap` 关闭 |
+| `--auto-exposure` | 逐视角测光并修正曝光，**默认开启** |
+| `--detail` | 程序化细节法线强度（代替游戏里不存在的 detailMap） |
+| `--wetness` / `--specular-mult` | 游戏 `overallWetness` / `specularMult` 全局调制 |
+| `--camo 01` | 应用迷彩遮罩（配合 `--camo-colors` 色板） |
+
+关于 GT 曲线的两个实测结论见 [`../docs/game-rendering-pipeline.md`](../docs/game-rendering-pipeline.md) 第 5 节。
+
+## 输出文件名
+
+每张图带分辨率：`<视角>_<宽>x<高>.png`，例如 `hero_3840x2160.png`。
+同一艘船不同分辨率的渲染可以并存。
+
+## 迷彩
+
+```powershell
+# 提取贴图时一并取回迷彩遮罩
+python extract_ship_textures.py --ship PGSB108_Bismarck --nation Germany --type Battleship --out textures --camo
+
+# 渲染时应用（01 / 02 是迷彩编号）
+blender -b --factory-startup -P render_ship.py -- --glb ... --out ... --textures textures --camo 01
+```
+
+**注意**：迷彩每个区域的实际颜色存在游戏的 `GameParams.data` 里，导出器没有暴露，
+默认用近似军灰色板。想精确还原需要另外解析该文件。
+
+单独的提取命令：
+
+```powershell
+python extract_ship_textures.py --ship PGSB108_Bismarck --nation Germany --type Battleship --out textures
+```
+
+调查细节（通道语义的推导过程、游戏参数表）见 [`../docs/game-rendering-pipeline.md`](../docs/game-rendering-pipeline.md)。
 
 ## 已知限制
 
 - 模型缺陷来自 `wows-model-exporter`：船体镜像、螺旋桨缺失/错位、鱼雷缺失、老模型不支持
-- 渲染默认涂装，未做迷彩替换
+- 迷彩遮罩可解码，但真实色板在 `GameParams.data` 里，目前用近似军灰色
 - 水面为程序化材质
 - 任务串行执行（一个跑完再下一个）

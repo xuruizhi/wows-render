@@ -12,6 +12,7 @@ Then open http://127.0.0.1:8770
 """
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -62,6 +63,8 @@ EXPORTER = os.path.join(TOOLS, "model-exporter", "wows-gltf-exporter.exe")
 LIST_SHIPS = os.path.join(TOOLS, "model-exporter", "wows-list-ships.exe")
 RENDER_PY = os.path.join(ROOT, "render_ship.py")
 SANITIZE_PY = os.path.join(ROOT, "sanitize_glb.py")
+EXTRACT_TEX_PY = os.path.join(ROOT, "extract_ship_textures.py")
+TEX_DIR = os.path.join(ROOT, "textures")
 PYTHON = sys.executable
 
 # Game install location. Override with the WOWS_GAME_DIR environment variable
@@ -164,7 +167,9 @@ def run_job(job):
     outdir = out_dir_for(ship)
     os.makedirs(outdir, exist_ok=True)
     views = p.get("views", ["hero"])
-    hero = os.path.join(outdir, views[0] + ".png")
+    # only the directory of --out matters to render_ship.py, but keep the name
+    # consistent with what it actually writes (<view>_<W>x<H>.png)
+    hero = os.path.join(outdir, f"{views[0]}_{p.get('res', '')}.png")
 
     try:
         # 1 ---- export
@@ -188,6 +193,23 @@ def run_job(job):
         if san.returncode != 0 or not os.path.exists(clean_glb):
             raise RuntimeError(f"清理失败: {san.stderr or san.stdout}")
 
+        # 2b ---- game PBS maps (_a/_mg/_n/_ao); without them the ship renders
+        # with flat albedo only and loses the metallic/gloss detail
+        job.status = "textures"
+        job.say("提取游戏 PBS 贴图（_a/_mg/_n/_ao）…")
+        ship_dir = TEX_DIR
+        tex = subprocess.run(
+            [PYTHON, EXTRACT_TEX_PY, "--game-dir", GAME_DIR, "--ship", ship["key"],
+             "--nation", ship["nation"], "--type", ship["type"], "--out", ship_dir],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        tex_args = []
+        if "EXTRACT_OK" in (tex.stdout or ""):
+            tex_args = ["--textures", ship_dir]
+            job.say("已载入游戏贴图（金属度/光泽、法线、AO）")
+        else:
+            job.say("贴图不可用，退回平面着色：" + (tex.stderr or "").strip()[-200:])
+
         # 3 ---- render
         job.status = "rendering"
         job.say(f"渲染 {p.get('res')} × {len(views)} 视角 (samples={p.get('samples')})…")
@@ -199,7 +221,7 @@ def run_job(job):
             "--samples", str(p["samples"]),
             "--views", ",".join(views),
             "--preset", p.get("preset", "day"),
-        ]
+        ] + tex_args
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -216,17 +238,28 @@ def run_job(job):
             raise RuntimeError("Blender 渲染失败（未返回 RENDER_OK）")
 
         # 4 ---- collect
+        # render_ship.py names files <view>_<W>x<H>.png; take whatever the
+        # current run just wrote so the resolution suffix doesn't have to be
+        # reconstructed here.
         rel_base = "/renders/" + "/".join(
             os.path.relpath(outdir, OUT_ROOT).split(os.sep)
         )
+        res_tag = p.get("res", "")
         made = []
         for v in views:
-            fp = os.path.join(outdir, v + ".png")
-            if os.path.exists(fp):
+            cand = os.path.join(outdir, f"{v}_{res_tag}.png")
+            if not os.path.exists(cand):
+                # fall back to the newest matching file (older naming schemes
+                # and re-renders at another resolution)
+                hits = glob.glob(os.path.join(outdir, glob.escape(v) + "_*.png"))
+                cand = max(hits, key=os.path.getmtime) if hits else cand
+            if os.path.exists(cand):
+                name = os.path.basename(cand)
                 made.append({
                     "view": v,
-                    "url": rel_base + "/" + v + ".png",
-                    "bytes": os.path.getsize(fp),
+                    "name": name,
+                    "url": rel_base + "/" + name,
+                    "bytes": os.path.getsize(cand),
                 })
         job.images = made
         job.say(f"完成，共 {len(made)} 张")
@@ -511,6 +544,7 @@ function setStatus(cls, text){
 
 const STATUS_ZH = {
   queued: '排队中', exporting: '导出模型', sanitizing: '清理网格',
+  textures: '提取贴图',
   rendering: '渲染中', done: '完成', error: '出错'
 };
 
