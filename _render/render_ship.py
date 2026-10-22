@@ -29,6 +29,9 @@ argv = argv[argv.index("--") + 1:] if "--" in argv else []
 ap = argparse.ArgumentParser()
 ap.add_argument("--glb", required=True)
 ap.add_argument("--out", required=True)
+ap.add_argument("--prefix", default="",
+                help="filename prefix placed before the view name, e.g. "
+                     "'Bismarck_Battleship_T8' -> Bismarck_Battleship_T8_hero_1920x1080.png")
 ap.add_argument("--res", default="3840x2160")
 ap.add_argument("--samples", type=int, default=128)
 ap.add_argument("--views", default="hero")
@@ -915,6 +918,9 @@ views = [v.strip() for v in args.views.split(",") if v.strip()]
 outdir = os.path.dirname(os.path.abspath(args.out))
 os.makedirs(outdir, exist_ok=True)
 base = os.path.splitext(os.path.basename(args.out))[0]
+# optional descriptive prefix so every output file is self-identifying when the
+# directory tree is flattened to a single level
+name_prefix = (args.prefix + "_") if args.prefix else ""
 
 for vname in views:
     az, el, dm, focal = VIEW_PRESETS.get(vname, VIEW_PRESETS["hero"])
@@ -1011,10 +1017,11 @@ for vname in views:
             scene.cycles.samples = args.samples
             scene.render.image_settings.file_format = "PNG"
 
-    # Name the output after the view plus the resolution, so a multi-view run
-    # yields <dir>/<view>_<W>x<H>.png and renders at different resolutions can
-    # sit side by side without overwriting each other.
-    outpath = os.path.join(outdir, "%s_%dx%d.png" % (vname, RES_X, RES_Y))
+    # Name the output <prefix><view>_<W>x<H>.png: the prefix carries ship/type/
+    # tier so files stay self-describing even in a flat per-nation folder, and
+    # the resolution keeps renders at different sizes from overwriting each other.
+    outpath = os.path.join(outdir, "%s%s_%dx%d.png"
+                           % (name_prefix, vname, RES_X, RES_Y))
     scene.render.filepath = outpath
     print("RENDER_INFO: rendering %s (dist=%.1f)" % (vname, dist))
     bpy.ops.render.render(write_still=True)

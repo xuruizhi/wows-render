@@ -15,6 +15,7 @@ import argparse
 import glob
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -22,7 +23,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 WARSHIPS = os.path.dirname(ROOT)
@@ -118,30 +119,95 @@ def load_catalog():
 
 
 def out_dir_for(ship):
+    """Output is flat: one folder per nation, everything else in the filename."""
     n = NATION_MAP.get(ship["nation"], ship["nation"])
-    t = TYPE_MAP.get(ship["type"], ship["type"])
-    tier = TIER_DIR.get(ship["tier"], "Tier " + ship["tier"])
-    return os.path.join(OUT_ROOT, n, t, tier, ship["key"])
+    return os.path.join(OUT_ROOT, n)
+
+
+def file_prefix_for(ship):
+    """Filename prefix carrying the info that used to be directory levels.
+
+    Layout is now WoWs_Renders/<nation>/<Ship>_<Type>_T<tier>_<view>_<W>x<H>.png
+    so a single folder stays browsable without four levels of nesting.
+    """
+    t = TYPE_MAP.get(ship["type"], ship["type"]).rstrip("s")
+    tier = ship["tier"]
+    tier_tag = "T%s" % tier if tier != "11" else "TStar"
+    key = os.path.splitext(ship["key"])[0]
+    name = "%s_%s_%s" % (key, t, tier_tag)
+    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)
 
 
 # ---------------------------------------------------------------- job manager
 _jobs = {}
 _jobs_lock = threading.Lock()
 
+STAGE_ZH = {
+    "queued": "排队中", "exporting": "导出模型", "sanitizing": "清理网格",
+    "textures": "提取贴图", "rendering": "渲染中", "running": "进行中",
+    "done": "完成", "error": "出错", "skipped": "跳过", "pending": "等待中",
+    "cancelled": "已取消",
+}
+
 
 class Job:
-    def __init__(self, jid, ship, params):
+    """One render request.
+
+    A request may cover a whole filtered list of ships (e.g. France /
+    Battleship / all tiers -> 17 ships). They are rendered strictly in order in
+    one background thread; ``ships`` carries every ship plus its own state so
+    the page can show which ones are done, running or waiting.
+    """
+
+    def __init__(self, jid, ships, params):
         self.id = jid
-        self.ship = ship
         self.params = params
-        self.status = "queued"     # queued|exporting|sanitizing|rendering|done|error
+        self.status = "queued"     # queued|<stage of current ship>|running|done|error
         self.log = []
         self.error = None
-        self.images = []
+        self.images = []           # images of the ship currently being rendered
         self.started = time.time()
         self.finished = None
+        self.cancel = threading.Event()
+        # per-ship state, rendered in this order
+        self.ships = []
+        for s in ships:
+            self.ships.append({
+                "ship": s,
+                "status": "pending",   # pending|running|done|error|skipped|cancelled
+                "error": None,
+                "images": [],
+                "elapsed": None,
+                "note": "",
+            })
+        self.index = -1                # index of the ship being rendered
+
+    @property
+    def total(self):
+        return len(self.ships)
+
+    def counts(self):
+        out = {"done": 0, "error": 0, "skipped": 0, "pending": 0,
+               "running": 0, "cancelled": 0}
+        for s in self.ships:
+            out[s["status"]] = out.get(s["status"], 0) + 1
+        return out
+
+    def current(self):
+        if 0 <= self.index < len(self.ships):
+            return self.ships[self.index]
+        return None
+
+    @property
+    def ship(self):
+        """The ship in focus (kept for older clients polling ``job.ship``)."""
+        cur = self.current()
+        if cur:
+            return cur["ship"]
+        return self.ships[0]["ship"] if self.ships else {}
 
     def to_dict(self):
+        cur = self.current()
         return {
             "id": self.id,
             "ship": self.ship,
@@ -151,15 +217,77 @@ class Job:
             "images": self.images,
             "elapsed": round((self.finished or time.time()) - self.started, 1),
             "params": self.params,
+            "total": self.total,
+            "index": self.index,
+            "current": (cur["ship"] if cur else None),
+            "counts": self.counts(),
+            "ships": self.ships,
         }
 
     def say(self, msg):
         stamp = time.strftime("%H:%M:%S")
         self.log.append(f"[{stamp}] {msg}")
+        # keep memory bounded on long batches: the UI only shows the tail
+        if len(self.log) > 400:
+            del self.log[:-250]
 
 
-def run_job(job):
-    ship = job.ship
+def run_batch(job):
+    """Render every ship of the job in order, then report a batch summary."""
+    params = job.params
+    views = params.get("views", ["hero"])
+    res_tag = params.get("res", "")
+    skip_existing = params.get("skip_existing", False)
+    n = job.total
+
+    for i, entry in enumerate(job.ships):
+        ship = entry["ship"]
+        label = "%d/%d %s %s" % (i + 1, n, ship.get("zh") or "", ship["key"])
+        if job.cancel.is_set():
+            entry["status"] = "cancelled"
+            continue
+
+        job.index = i
+        job.status = "running"
+        job.images = []
+
+        if skip_existing:
+            outdir = out_dir_for(ship)
+            prefix = file_prefix_for(ship)
+            hero = os.path.join(outdir, f"{prefix}_{views[0]}_{res_tag}.png")
+            if os.path.exists(hero):
+                entry["status"] = "skipped"
+                entry["note"] = "已存在，跳过"
+                job.say(f"[{label}] 已存在，跳过")
+                continue
+
+        entry["status"] = "running"
+        job.say(f"===== [{label}] 国家 {ship['nation']} · {ship['type']} · Tier {ship['tier']} =====")
+        t0 = time.time()
+        run_ship(job, entry)
+        entry["elapsed"] = round(time.time() - t0, 1)
+        if entry["status"] not in ("done", "error"):
+            entry["status"] = "error" if entry["error"] else "done"
+
+    c = job.counts()
+    job.status = "done"
+    job.finished = time.time()
+    job.images = []
+    summary = "批次结束：成功 %d，%s %d，失败 %d%s" % (
+        c["done"],
+        "已取消" if job.cancel.is_set() else "跳过",
+        c["skipped"] + c["cancelled"],
+        c["error"],
+        "（剩余 %d 艘未渲染）" % c["cancelled"] if job.cancel.is_set() else "")
+    job.say(summary)
+    failed = [e["ship"]["key"] for e in job.ships if e["status"] == "error"]
+    if failed:
+        job.say("失败的船：" + ", ".join(failed))
+
+
+def run_ship(job, entry):
+    """Export -> sanitize -> textures -> render for one ship of the batch."""
+    ship = entry["ship"]
     p = job.params
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in ship["key"])
     raw_glb = os.path.join(GLB_DIR, safe + ".raw.glb")
@@ -167,13 +295,21 @@ def run_job(job):
     outdir = out_dir_for(ship)
     os.makedirs(outdir, exist_ok=True)
     views = p.get("views", ["hero"])
-    # only the directory of --out matters to render_ship.py, but keep the name
-    # consistent with what it actually writes (<view>_<W>x<H>.png)
-    hero = os.path.join(outdir, f"{views[0]}_{p.get('res', '')}.png")
+    prefix = file_prefix_for(ship)
+    # only the directory of --out matters to render_ship.py; the real filename is
+    # <prefix>_<view>_<W>x<H>.png, which --prefix makes it produce
+    hero = os.path.join(outdir, f"{prefix}_{views[0]}_{p.get('res', '')}.png")
+
+    def stage(name):
+        # ``job.status`` drives the batch indicator, ``entry["status"]`` the
+        # per-ship row in the list on the page
+        job.status = name
+        entry["status"] = "running"
+        entry["note"] = STAGE_ZH.get(name, name)
 
     try:
         # 1 ---- export
-        job.status = "exporting"
+        stage("exporting")
         job.say(f"导出模型 {ship['key']} (贴图上限 {p.get('tex', 4096)}px)…")
         exp = subprocess.run(
             [EXPORTER, "-W", GAME_DIR, "-s", ship["key"], "-o", raw_glb, "-Z", str(p.get("tex", 4096))],
@@ -184,7 +320,7 @@ def run_job(job):
             raise RuntimeError(f"模型导出失败: {tail or exp.stderr}")
 
         # 2 ---- sanitize
-        job.status = "sanitizing"
+        stage("sanitizing")
         job.say("清理空 mesh…")
         san = subprocess.run(
             [PYTHON, SANITIZE_PY, raw_glb, clean_glb],
@@ -195,7 +331,7 @@ def run_job(job):
 
         # 2b ---- game PBS maps (_a/_mg/_n/_ao); without them the ship renders
         # with flat albedo only and loses the metallic/gloss detail
-        job.status = "textures"
+        stage("textures")
         job.say("提取游戏 PBS 贴图（_a/_mg/_n/_ao）…")
         ship_dir = TEX_DIR
         tex = subprocess.run(
@@ -211,7 +347,7 @@ def run_job(job):
             job.say("贴图不可用，退回平面着色：" + (tex.stderr or "").strip()[-200:])
 
         # 3 ---- render
-        job.status = "rendering"
+        stage("rendering")
         job.say(f"渲染 {p.get('res')} × {len(views)} 视角 (samples={p.get('samples')})…")
         cmd = [
             BLENDER, "-b", "--factory-startup", "-P", RENDER_PY, "--",
@@ -220,6 +356,7 @@ def run_job(job):
             "--res", p["res"],
             "--samples", str(p["samples"]),
             "--views", ",".join(views),
+            "--prefix", prefix,
             "--preset", p.get("preset", "day"),
         ] + tex_args
         proc = subprocess.Popen(
@@ -238,20 +375,20 @@ def run_job(job):
             raise RuntimeError("Blender 渲染失败（未返回 RENDER_OK）")
 
         # 4 ---- collect
-        # render_ship.py names files <view>_<W>x<H>.png; take whatever the
-        # current run just wrote so the resolution suffix doesn't have to be
-        # reconstructed here.
+        # render_ship.py writes <prefix>_<view>_<W>x<H>.png into the flat
+        # per-nation folder; take whatever this run produced.
         rel_base = "/renders/" + "/".join(
             os.path.relpath(outdir, OUT_ROOT).split(os.sep)
         )
         res_tag = p.get("res", "")
         made = []
         for v in views:
-            cand = os.path.join(outdir, f"{v}_{res_tag}.png")
+            cand = os.path.join(outdir, f"{prefix}_{v}_{res_tag}.png")
             if not os.path.exists(cand):
                 # fall back to the newest matching file (older naming schemes
                 # and re-renders at another resolution)
-                hits = glob.glob(os.path.join(outdir, glob.escape(v) + "_*.png"))
+                hits = glob.glob(os.path.join(
+                    outdir, glob.escape(prefix) + "_" + glob.escape(v) + "_*.png"))
                 cand = max(hits, key=os.path.getmtime) if hits else cand
             if os.path.exists(cand):
                 name = os.path.basename(cand)
@@ -261,16 +398,19 @@ def run_job(job):
                     "url": rel_base + "/" + name,
                     "bytes": os.path.getsize(cand),
                 })
+        entry["images"] = made
         job.images = made
+        entry["status"] = "done"
+        entry["error"] = None
+        entry["note"] = f"{len(made)} 张"
         job.say(f"完成，共 {len(made)} 张")
-        job.status = "done"
-        job.finished = time.time()
 
     except Exception as e:
-        job.status = "error"
+        entry["status"] = "error"
+        entry["error"] = str(e)
+        entry["note"] = "失败"
         job.error = str(e)
         job.say("错误: " + str(e))
-        job.finished = time.time()
     finally:
         for f in (raw_glb, clean_glb):
             try:
@@ -278,6 +418,29 @@ def run_job(job):
                     os.remove(f)
             except OSError:
                 pass
+
+
+# ---------------------------------------------------------------- job queue
+# One worker thread: batches run strictly in order and two Blender/exporter
+# processes never fight over the GPU or the same files in glb/.
+_work = queue.Queue()
+
+
+def _worker():
+    while True:
+        job = _work.get()
+        try:
+            run_batch(job)
+        except Exception as e:          # never let the worker die
+            job.status = "error"
+            job.error = str(e)
+            job.finished = time.time()
+            job.say("批次异常结束: " + str(e))
+        finally:
+            _work.task_done()
+
+
+threading.Thread(target=_worker, name="render-worker", daemon=True).start()
 
 
 # ---------------------------------------------------------------- HTTP
@@ -332,6 +495,38 @@ pre.log{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
 .shot a{color:var(--accent);text-decoration:none}
 .shot a:hover{text-decoration:underline}
 .hint{font-size:11.5px;color:var(--mute);margin-top:7px}
+/* batch progress */
+.batch{display:none;margin-bottom:12px}
+.batch.on{display:block}
+.bar{height:7px;background:#0b0f14;border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.bar > i{display:block;height:100%;width:0;background:var(--accent);transition:width .3s}
+.batch .sum{font-size:11.5px;color:var(--mute);margin-top:6px;display:flex;
+            justify-content:space-between;gap:10px}
+ol.queue{list-style:none;margin:0 0 4px;padding:0;max-height:236px;overflow:auto;
+         border:1px solid var(--line);border-radius:8px}
+.queue li{display:grid;grid-template-columns:20px 1fr auto auto;gap:8px;align-items:center;
+          padding:5px 9px;font-size:12px;border-bottom:1px solid #1d2530}
+.queue li:last-child{border-bottom:none}
+.queue li .n{color:#5b6673;text-align:right;font-variant-numeric:tabular-nums}
+.queue li .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.queue li .nm em{font-style:normal;color:var(--mute);margin-left:6px;font-size:11px}
+.queue li .st{font-size:11px;color:var(--mute);white-space:nowrap}
+.queue li .sec{font-size:11px;color:#5b6673;white-space:nowrap;
+               font-variant-numeric:tabular-nums;min-width:46px;text-align:right}
+.queue li.running{background:rgba(210,153,34,.10)}
+.queue li.running .st{color:var(--warn)}
+.queue li.done .st{color:var(--ok)}
+.queue li.error{background:rgba(248,81,73,.08)}
+.queue li.error .st{color:var(--err)}
+.queue li.skipped .st,.queue li.cancelled .st{color:#5b6673}
+.opt{display:flex;align-items:center;gap:7px;margin-top:12px;font-size:12.5px;
+     color:var(--mute);cursor:pointer;user-select:none}
+.opt input{width:auto;margin:0}
+.btn.ghost{background:#2b3644;color:var(--fg);margin-top:9px}
+.btn.ghost:hover{filter:brightness(1.25)}
+# 默认全选、可按 Ctrl / Shift 加减选；单击是加/减选，不会把其余选择清空。
+# 勾「全部生成」后，提交的就是整张筛选列表，按列表顺序渲染。
+#ship{user-select:none}
 </style>
 </head>
 <body>
@@ -351,7 +546,10 @@ pre.log{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
       <select id="tier"><option value="">全部级别</option></select>
 
       <label>战舰 <span id="count" class="meta"></span></label>
-      <select id="ship" size="9" style="height:auto"></select>
+      <select id="ship" size="9" multiple style="height:auto"></select>
+
+      <label class="opt"><input type="checkbox" id="allsel">
+        全选本列表（共 <span id="alln">0</span> 艘）· 单击某一行加/减选，Ctrl / Shift 连选</label>
 
       <label>分辨率</label>
       <select id="res"></select>
@@ -377,6 +575,7 @@ pre.log{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
 
       <button class="btn" id="go">开始生成</button>
       <div class="meta" id="est"></div>
+      <button class="btn ghost" id="cancel" style="display:none">取消任务</button>
     </div>
 
     <div class="card">
@@ -384,6 +583,11 @@ pre.log{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
         <span class="dot" id="dot"></span>
         <span id="stat">就绪 — 选择战舰后点击「开始生成」</span>
       </div>
+      <div class="batch" id="batch">
+        <div class="bar"><i id="barfill"></i></div>
+        <div class="sum"><span id="batchsum"></span><span id="batcheta"></span></div>
+      </div>
+      <ol class="queue" id="queue" style="display:none"></ol>
       <pre class="log" id="log">等待任务…</pre>
       <div class="shots" id="shots"></div>
     </div>
@@ -393,6 +597,7 @@ pre.log{background:#0b0f14;border:1px solid var(--line);border-radius:8px;
 <script>
 const $ = s => document.querySelector(s);
 let CAT = null, SHIPS = [], CUR = null, POLL = null, VIEWS = [];
+let SEL = [], JOBID = null;
 
 async function init(){
   CAT = await (await fetch('/api/catalog')).json();
@@ -416,6 +621,21 @@ async function init(){
 
   buildViewChips();
   refresh();
+  resumeRunning();
+}
+
+// if a batch was already running (page refreshed, or another tab started it),
+// pick the polling back up instead of leaving it invisible
+async function resumeRunning(){
+  try {
+    const st = await (await fetch('/api/jobs')).json();
+    const j = (st.jobs || []).find(x => x.status !== 'done' && x.status !== 'error');
+    if(!j) return;
+    $('#go').disabled = true;
+    $('#cancel').style.display = '';
+    $('#batch').classList.add('on');
+    poll(j.id);
+  } catch(e){}
 }
 
 function fillSel(sel, pairs, keep){
@@ -471,6 +691,14 @@ function filtered(){
     (!$('#tier').value   || s.tier   === $('#tier').value));
 }
 
+function selectedShips(){
+  // every ticked row, in list (= catalogue) order. Selection state is read from
+  // each <option>; the <select> element's own value/selectedIndex only reflects
+  // the last option and must not be used here.
+  const box = $('#ship');
+  return [...box.options].filter(o => o.selected).map(o => o.value);
+}
+
 function refresh(){
   const list = filtered();
   const sel = $('#ship');
@@ -479,10 +707,23 @@ function refresh(){
     const o = document.createElement('option');
     o.value = s.key;
     o.textContent = `${s.zh} ${s.en}  ·  ${s.tierZh} ${s.typeZh}  ·  ${s.nationZh} ${s.nation}`;
+    // 默认全选整张筛选列表
+    o.selected = true;
     sel.appendChild(o);
   }
-  $('#count').textContent = `（共 ${list.length} 艘）`;
+  sel.multiple = true;
+  // 列表默认全选，单击是加/减选（不靠 Ctrl 也能切换）；
+  // Ctrl / Shift 仍是原生的「追加 / 范围选择」。
+  // 注意：选中状态一律以每个 option.selected 为准，不看 <select> 的
+  // value / selectedIndex（后者只代表"最后一项"）。
+  sel.onmousedown = e => {
+    if(e.ctrlKey || e.metaKey || e.shiftKey) return;
+    [...sel.options].forEach(o => { o.selected = false; });
+  };
+  syncAllBox();
+  $('#alln').textContent = list.length;
   CUR = list[0] || null;
+  SEL = list.slice();
   estimate();
 }
 
@@ -498,43 +739,93 @@ function estimate(){
           : base < 3600 ? `${(base/60).toFixed(1)} 分钟`
           : `${(base/3600).toFixed(1)} 小时`;
   $('#viewhint').textContent = views ? `已选 ${views} 个` : '未选';
-  $('#est').textContent = CUR
-    ? `已选：${CUR.nationZh} ${CUR.nation} / ${CUR.typeZh} / ${CUR.tierZh} · 预计约 ${s}`
-    : '';
+
+  // batch size = ticked ships (each ship costs the per-ship estimate)
+  const keys = selectedShips();
+  const n = keys.length;
+  SEL = keys.map(k => SHIPS.find(s => s.key === k)).filter(Boolean);
+  // 预览信息跟着"真正会提交的清单"走：批量时展示第一艘 = 渲染顺序的第一艘
+  CUR = SEL[0] || null;
+
+  const total = base * Math.max(n, 1);
+  const tt = total < 60 ? `${Math.round(total)} 秒`
+           : total < 3600 ? `${(total/60).toFixed(1)} 分钟`
+           : `${(total/3600).toFixed(1)} 小时`;
+  if(!CUR){
+    $('#est').textContent = '未选择战舰';
+  } else if(n > 1){
+    $('#est').textContent =
+      `将按顺序生成 ${n} 艘 · 每艘约 ${s} · 合计约 ${tt}`;
+  } else {
+    $('#est').textContent =
+      `已选：${CUR.nationZh} ${CUR.nation} / ${CUR.typeZh} / ${CUR.tierZh} · 预计约 ${tt}`;
+  }
 }
 
 $('#nation').onchange = $('#type').onchange = $('#tier').onchange = refresh;
-$('#ship').onchange = e => {
-  CUR = SHIPS.find(s => s.key === e.target.value);
+$('#ship').onchange = () => { syncAllBox(); estimate(); };
+$('#ship').oninput = $('#ship').onchange;
+// keep the "全部生成" box in step without assuming the browser copied an
+// option's selected state onto the <select> element itself
+function syncAllBox(){
+  const box = $('#ship');
+  const n = box.options.length;
+  const on = [...box.options].filter(o => o.selected).length;
+  $('#allsel').checked = n > 0 && on === n;
+  $('#allsel').indeterminate = on > 0 && on < n;
+  $('#count').textContent = n ? `（共 ${n} 艘，已选 ${on} 艘）` : '（无匹配战舰）';
+}
+$('#allsel').onchange = e => {
+  const on = e.target.checked;
+  const box = $('#ship');
+  [...box.options].forEach(o => { o.selected = on; });
+  if(on && box.options.length) box.options[box.options.length - 1].selected = true;
   estimate();
 };
 $('#res').onchange = estimate;
 $('#samples').onchange = estimate;
 
 $('#go').onclick = async () => {
-  if(!CUR) return alert('请先选择战舰');
+  const keys = selectedShips();
+  if(!keys.length) return alert('请先在上面的列表里选择战舰（可按住 Ctrl / Shift 多选，或勾选「全部生成」）');
   const views = [...document.querySelectorAll('.chip[data-v].on')].map(c => c.dataset.v);
   if(!views.length) return alert('请至少选择一个视角');
   $('#go').disabled = true;
   $('#shots').innerHTML = '';
+  $('#queue').innerHTML = '';
+  $('#queue').style.display = '';
+  $('#batch').classList.add('on');
   $('#log').textContent = '提交中…';
-  setStatus('busy', '提交任务…');
+  setStatus('busy', `提交 ${keys.length} 艘…`);
 
-  const r = await fetch('/api/render', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      key: CUR.key,
-      res: $('#res').value,
-      samples: +$('#samples').value,
-      views,
-      preset: $('#preset').value,
-      tex: 4096
-    })
-  });
-  const j = await r.json();
+  let r, j;
+  try {
+    r = await fetch('/api/render', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        keys,
+        res: $('#res').value,
+        samples: +$('#samples').value,
+        views,
+        preset: $('#preset').value,
+        tex: 4096
+      })
+    });
+    j = await r.json();
+  } catch(err){
+    setStatus('err', '提交失败：' + err); $('#go').disabled = false; return;
+  }
   if(j.error){ setStatus('err', j.error); $('#go').disabled = false; return; }
+  $('#cancel').style.display = '';
   poll(j.id);
+};
+
+$('#cancel').onclick = async () => {
+  if(!JOBID) return;
+  $('#cancel').disabled = true;
+  try { await fetch('/api/cancel/' + JOBID, {method: 'POST'}); } catch(e){}
+  $('#cancel').disabled = false;
 };
 
 function setStatus(cls, text){
@@ -543,35 +834,107 @@ function setStatus(cls, text){
 }
 
 const STATUS_ZH = {
-  queued: '排队中', exporting: '导出模型', sanitizing: '清理网格',
-  textures: '提取贴图',
-  rendering: '渲染中', done: '完成', error: '出错'
+  queued: '排队中', pending: '等待中', running: '进行中',
+  exporting: '导出模型', sanitizing: '清理网格', textures: '提取贴图',
+  rendering: '渲染中', done: '完成', error: '出错',
+  skipped: '已跳过', cancelled: '已取消'
 };
 
-function poll(id){
-  clearInterval(POLL);
-  POLL = setInterval(async () => {
-    const j = await (await fetch('/api/job/' + id)).json();
-    $('#log').textContent = (j.log || []).join('\n') || '…';
-    $('#log').scrollTop = $('#log').scrollHeight;
+const SHIP_ZH = {
+  pending: '等待中', running: '进行中', done: '完成', error: '出错',
+  skipped: '已跳过', cancelled: '已取消'
+};
 
-    const label = STATUS_ZH[j.status] || j.status;
-    setStatus(j.status === 'done' ? 'done' : (j.status === 'error' ? 'err' : 'busy'),
-              `${label}  ${j.elapsed.toFixed(0)} 秒  ·  ${j.ship.zh || j.ship.key}${j.ship.en ? " " + j.ship.en : ""}`);
-
-    if(j.images && j.images.length) renderShots(j.images);
-
-    if(j.status === 'done'){
-      clearInterval(POLL); $('#go').disabled = false;
-      setStatus('done', `完成 · 用时 ${j.elapsed.toFixed(0)} 秒 · ${j.images.length} 张`);
-    } else if(j.status === 'error'){
-      clearInterval(POLL); $('#go').disabled = false;
-      setStatus('err', '失败：' + (j.error || '未知错误'));
-    }
-  }, 1500);
+function fmtSec(s){
+  if(s == null) return '';
+  return s < 60 ? `${Math.round(s)}s` : `${(s/60).toFixed(1)}m`;
 }
 
-function renderShots(imgs){
+function renderQueue(j){
+  const ol = $('#queue');
+  ol.style.display = '';
+  // rebuild only when the batch (or its state) changed shape; cheap enough
+  const sig = j.ships.map(s => s.status + (s.elapsed || '')).join('|');
+  if(ol.dataset.sig === sig) return;
+  ol.dataset.sig = sig;
+  ol.innerHTML = '';
+  j.ships.forEach((e, i) => {
+    const s = e.ship;
+    const li = document.createElement('li');
+    li.className = e.status;
+    const st = e.status === 'running'
+      ? (STATUS_ZH[j.status] || '进行中')
+      : (SHIP_ZH[e.status] || e.status);
+    li.innerHTML =
+      `<span class="n">${i+1}</span>
+       <span class="nm">${s.zh || s.key} <em>${s.key} · ${s.tierZh} ${s.typeZh}</em></span>
+       <span class="st">${st}</span>
+       <span class="sec">${fmtSec(e.elapsed)}</span>`;
+    if(e.error) li.title = e.error;
+    ol.appendChild(li);
+  });
+  const cur = ol.querySelector('li.running');
+  if(cur) cur.scrollIntoView({block:'nearest'});
+}
+
+function renderBatch(j){
+  $('#batch').classList.add('on');
+  const c = j.counts || {};
+  const total = j.total || 1;
+  const fin = (c.done||0) + (c.error||0) + (c.skipped||0) + (c.cancelled||0);
+  $('#barfill').style.width = `${Math.round(fin / total * 100)}%`;
+  $('#batchsum').textContent =
+    `${fin} / ${total} · 完成 ${c.done||0} · 跳过 ${(c.skipped||0)+(c.cancelled||0)} · 失败 ${c.error||0}`;
+  // rough remaining time from the ships finished so far
+  const doneEls = j.ships.filter(s => s.elapsed);
+  const avg = doneEls.length
+    ? doneEls.reduce((a, s) => a + s.elapsed, 0) / doneEls.length : null;
+  const left = total - fin;
+  $('#batcheta') .textContent = (avg && left > 0 && j.status !== 'done')
+    ? `剩余约 ${fmtSec(avg * left)}（每艘均 ${fmtSec(avg)}）` : '';
+}
+
+function applyJob(j){
+  $('#log').textContent = (j.log || []).join('\n') || '…';
+  $('#log').scrollTop = $('#log').scrollHeight;
+  if(j.total) renderBatch(j);
+  if(j.ships) renderQueue(j);
+  if(j.images && j.images.length) renderShots(j.images, j.current);
+
+  const label = STATUS_ZH[j.status] || j.status;
+  if(j.status === 'done'){
+    const c = j.counts || {};
+    setStatus((c.error ? 'err' : 'done'),
+      `批次完成 · 用时 ${fmtSec(j.elapsed)} · 完成 ${c.done||0} · 跳过 ${(c.skipped||0)+(c.cancelled||0)} · 失败 ${c.error||0}`);
+  } else if(j.status === 'error'){
+    setStatus('err', '失败：' + (j.error || '未知错误'));
+  } else {
+    const cur = j.current;
+    setStatus('busy',
+      `${label} · ${j.index >= 0 ? j.index + 1 : 0} / ${j.total} · ${cur ? (cur.zh || cur.key) : ''}`);
+  }
+}
+
+function poll(id){
+  JOBID = id;
+  clearInterval(POLL);
+  const tick = async () => {
+    let j;
+    try { j = await (await fetch('/api/job/' + id)).json(); }
+    catch(e){ return; }              // transient, try again on the next tick
+    if(!j || j.error) return;
+    applyJob(j);
+    if(j.status === 'done' || j.status === 'error'){
+      clearInterval(POLL); POLL = null;
+      $('#go').disabled = false;
+      $('#cancel').style.display = 'none';
+    }
+  };
+  tick();
+  POLL = setInterval(tick, 2000);
+}
+
+function renderShots(imgs, ship){
   const box = $('#shots');
   const have = [...box.children].map(c => c.dataset.v);
   for(const im of imgs){
@@ -579,10 +942,11 @@ function renderShots(imgs){
     const v = VIEWS.find(v => v.key === im.view);
     const d = document.createElement('div');
     d.className = 'shot'; d.dataset.v = im.view;
+    const who = ship ? `${ship.zh || ship.key} · ` : '';
     d.innerHTML =
       `<a href="${im.url}" target="_blank"><img src="${im.url}" loading="lazy"></a>
        <div class="cap">
-         <span>${v ? v.zh + '（' + im.view + '）' : im.view}</span>
+         <span>${who}${v ? v.zh + '（' + im.view + '）' : im.view}</span>
          <span>${(im.bytes/1048576).toFixed(1)} MB · <a href="${im.url}" download>下载</a></span>
        </div>`;
     box.appendChild(d);
@@ -638,6 +1002,45 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(e)}, 500)
             return
 
+        # cheap "is this already rendered at the current settings" probe, so the
+        # page can show how many of the selected ships still need a render
+        if path == "/api/done":
+            q = parse_qs(urlparse(self.path).query)
+            res = q.get("res", [""])[0]
+            view = q.get("view", ["hero"])[0]
+            keys = [k for k in q.get("key", []) if k]
+            try:
+                ships = load_ships()
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
+                return
+            by_key = {s["key"]: s for s in ships}
+            done = []
+            for k in keys:
+                s = by_key.get(k)
+                if not s:
+                    continue
+                hero = os.path.join(out_dir_for(s), f"{file_prefix_for(s)}_{view}_{res}.png")
+                if os.path.exists(hero):
+                    done.append(k)
+            self._json({"done": done, "total": len(keys)})
+            return
+
+        # lightweight list of jobs (no per-ship payload) — used by the page to
+        # re-attach to a batch that is still running after a refresh
+        if path == "/api/jobs":
+            jobs = [{
+                "id": j.id,
+                "status": j.status,
+                "total": j.total,
+                "index": j.index,
+                "started": j.started,
+                "finished": j.finished,
+            } for j in list(_jobs.values())]
+            jobs.sort(key=lambda x: x["started"], reverse=True)
+            self._json({"jobs": jobs[:20]})
+            return
+
         if path.startswith("/api/job/"):
             jid = path.rsplit("/", 1)[-1]
             job = _jobs.get(jid)
@@ -661,7 +1064,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, "not found")
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/render":
+        route = urlparse(self.path).path
+
+        # cancel a running batch: the current ship finishes, the rest are marked
+        if route.startswith("/api/cancel/"):
+            jid = route.rsplit("/", 1)[-1]
+            job = _jobs.get(jid)
+            if not job:
+                self._json({"error": "unknown job"}, 404)
+                return
+            job.cancel.set()
+            job.say("收到取消请求，当前这艘完成后停止")
+            self._json({"ok": True})
+            return
+
+        if route != "/api/render":
             self._send(404, "not found")
             return
         try:
@@ -671,11 +1088,32 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"bad request: {e}"}, 400)
             return
 
-        key = req.get("key")
+        # Ship selection. New clients send every selected ship:
+        #   {"keys": [...]}            explicit list, order preserved
+        #   {"nation","type","tier"}   filter ("" = any), order as in the catalogue
+        # Old clients send a single {"key": "..."}.
         ships = load_ships()
-        ship = next((s for s in ships if s["key"] == key), None)
-        if not ship:
-            self._json({"error": f"unknown ship: {key}"}, 400)
+        requested = [k for k in (req.get("keys") or []) if k]
+        if not requested and req.get("key"):
+            requested = [req["key"]]
+
+        if requested:
+            by_key = {s["key"]: s for s in ships}
+            unknown = [k for k in requested if k not in by_key]
+            if unknown:
+                self._json({"error": f"unknown ship(s): {', '.join(unknown[:5])}"}, 400)
+                return
+            selected = [by_key[k] for k in requested]
+        else:
+            nation = req.get("nation") or ""
+            typ = req.get("type") or ""
+            tier = req.get("tier") or ""
+            selected = [s for s in ships
+                        if (not nation or s["nation"] == nation)
+                        and (not typ or s["type"] == typ)
+                        and (not tier or s["tier"] == tier)]
+        if not selected:
+            self._json({"error": "没有选中任何战舰"}, 400)
             return
 
         # validate resolution against the measured ceiling (16K)
@@ -696,13 +1134,27 @@ class Handler(BaseHTTPRequestHandler):
             "views": views,
             "preset": req.get("preset", "day"),
             "tex": int(req.get("tex", 4096)),
+            # true = leave ships that already have their hero view at this
+            # resolution alone (matched by file name prefix)
+            "skip_existing": bool(req.get("skip_existing", False)),
         }
 
+        previous = [j for j in _jobs.values() if j.status not in ("done", "error")]
+        if previous:
+            self._json({"error": "已有任务在跑（任务 %s 共 %d 艘）。等它结束或先点「取消」再提交。"
+                                  % (previous[0].id, previous[0].total)}, 409)
+            return
+
         jid = uuid.uuid4().hex[:12]
-        job = Job(jid, ship, params)
+        job = Job(jid, selected, params)
         _jobs[jid] = job
-        threading.Thread(target=run_job, args=(job,), daemon=True).start()
-        self._json({"id": jid})
+        # record the exact order so a "only one ship got rendered" report can
+        # be checked against what the browser actually submitted
+        print("[job %s] %d 艘: %s" % (
+            jid, len(selected), ", ".join(s["key"] for s in selected)), flush=True)
+        _work.put(job)
+        self._json({"id": jid, "total": len(selected),
+                    "keys": [s["key"] for s in selected]})
 
 
 def main():

@@ -6,8 +6,9 @@ For each ship:
   2. sanitize_glb.py     -> drop empty meshes so Blender can import it
   3. Blender + Cycles    -> 4K PNG renders
 
-Output layout mirrors the existing wiki gallery:
-  WoWs_Renders/<Nation>/<Type>/Tier <Tier>/<ShipKey>/<view>_<W>x<H>.png
+Output layout is flat: one folder per nation, all details in the filename.
+  WoWs_Renders/<Nation>/<ShipKey>_<Type>_T<Tier>_<view>_<W>x<H>.png
+  e.g. WoWs_Renders/Germany/PGSB108_Bismarck_Battleship_T8_hero_1920x1080.png
 
 Usage
 -----
@@ -193,21 +194,21 @@ $typeMap = @{
 }
 
 function Get-OutDir($ship) {
+    # Output is flat: one folder per nation. Everything that used to be a
+    # directory level (type, tier, ship key) now lives in the filename prefix.
     $n = $ship.Nation
     if ($nationMap.ContainsKey($n)) { $n = $nationMap[$n] }
+    return Join-Path $OutRoot $n
+}
+
+function Get-FilePrefix($ship) {
     $t = $ship.Type
     if ($typeMap.ContainsKey($t)) { $t = $typeMap[$t] }
-    $tierNum = $ship.Tier
-    $tierDir = switch ($tierNum) {
-        "1"  { "Tier I" };    "2"  { "Tier II" };   "3"  { "Tier III" }
-        "4"  { "Tier IV" };   "5"  { "Tier V" };    "6"  { "Tier VI" }
-        "7"  { "Tier VII" };  "8"  { "Tier VIII" }; "9"  { "Tier IX" }
-        "10" { "Tier X" };    "11" { "Tier Star" }
-        default { "Tier $tierNum" }
-    }
+    $t = $t.TrimEnd("s")
+    $tierTag = if ($ship.Tier -eq "11") { "TStar" } else { "T$($ship.Tier)" }
+    $name = "$($ship.Key)_$($t)_$tierTag"
     # keep it filesystem-safe
-    $tierDir = $tierDir -replace [regex]::Escape([string][char]0x2605), "Star"
-    return Join-Path $OutRoot (Join-Path (Join-Path (Join-Path $n $t) $tierDir) $ship.Key)
+    return ($name -replace '[\\/:*?"<>|]', "_")
 }
 
 function Write-Log($status, $ship, $note) {
@@ -229,9 +230,10 @@ foreach ($ship in $targets) {
     $mask = "RENDER $idx/$($targets.Count) $($ship.Key) [$($ship.Nation)/$($ship.Type)/T$($ship.Tier)]"
 
     $heroName = ($Views -split ",")[0].Trim()
-    # render_ship.py writes <view>_<W>x<H>.png, so the existence probe must use
-    # the same resolution suffix, otherwise -SkipExisting never matches
-    $heroPath = Join-Path $outDir "$($heroName)_$Res.png"
+    $filePrefix = Get-FilePrefix $ship
+    # render_ship.py writes <prefix>_<view>_<W>x<H>.png, so the existence probe
+    # must use the same prefix and resolution suffix, or -SkipExisting never matches
+    $heroPath = Join-Path $outDir "$($filePrefix)_$($heroName)_$Res.png"
     if ($SkipExisting -and (Test-Path $heroPath)) {
         Write-Host "$mask -> skip (exists)" -ForegroundColor DarkGray
         $skipCount++
@@ -285,6 +287,7 @@ foreach ($ship in $targets) {
             "--res", $Res,
             "--samples", "$Samples",
             "--views", $Views,
+            "--prefix", $filePrefix,
             "--preset", $Preset
         ) + $texArgs
         $rOut = & $Blender @blenderArgs 2>&1 | Out-String
